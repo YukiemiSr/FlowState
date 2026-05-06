@@ -1,92 +1,109 @@
+"""Git 状态只读接口 + Worktree 清理接口。
+
+路由前缀：/api/v1/pipelines/{pipeline_id}/git
+"""
+
 from __future__ import annotations
 
-"""Git 状态查询与清理接口。"""
+from fastapi import APIRouter, Depends, HTTPException
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-
-from src.api.deps import get_pipeline_service
 from src.api.service import PipelineService
-from src.models.pipeline import StageType
-from src.services.git_service import GitError
+from src.models.pipeline import GitContext
+
+router = APIRouter()
 
 
-router = APIRouter(prefix="/api/v1/pipelines", tags=["git"])
+def _get_service() -> PipelineService:
+    from src.api.app import get_pipeline_service  # 避免循环导入
+    return get_pipeline_service()
 
 
-async def _load_pipeline_or_404(pipeline_id: str, service: PipelineService):
-    pipeline = await service.get_pipeline(pipeline_id)
-    if pipeline is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
-    return pipeline
+# ---------------------------------------------------------------------------
+# GET /api/v1/pipelines/{pipeline_id}/git
+# ---------------------------------------------------------------------------
 
 
-@router.get("/{pipeline_id}/git/status")
+@router.get("/{pipeline_id}/git", summary="获取流水线 Git 状态")
 async def get_git_status(
     pipeline_id: str,
-    service: PipelineService = Depends(get_pipeline_service),
-):
-    pipeline = await _load_pipeline_or_404(pipeline_id, service)
-    return pipeline.context.git.model_dump()
+    service: PipelineService = Depends(_get_service),
+) -> dict:
+    """返回该流水线的 GitContext 快照，包括分支信息、stage commit 列表、diff stats 等。"""
+    pipeline = await service.get_pipeline(pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline not found: {pipeline_id}")
+
+    git_ctx: GitContext = pipeline.context.git
+    return {
+        "pipeline_id": pipeline_id,
+        "git": git_ctx.model_dump(),
+    }
 
 
-@router.get("/{pipeline_id}/git/diff")
-async def get_git_diff(
+# ---------------------------------------------------------------------------
+# DELETE /api/v1/pipelines/{pipeline_id}/git/worktree
+# ---------------------------------------------------------------------------
+
+
+@router.delete("/{pipeline_id}/git/worktree", summary="清理流水线 Worktree")
+async def cleanup_worktree(
     pipeline_id: str,
-    service: PipelineService = Depends(get_pipeline_service),
-) -> Response:
-    pipeline = await _load_pipeline_or_404(pipeline_id, service)
+    service: PipelineService = Depends(_get_service),
+) -> dict:
+    """移除该流水线关联的 git worktree 及对应功能分支。
+
+    仅在 pipeline 已 COMPLETED / CANCELLED / FAILED 时允许操作。
+    """
+    from src.models.pipeline import PipelineStatus
+
+    pipeline = await service.get_pipeline(pipeline_id)
+    if pipeline is None:
+        raise HTTPException(status_code=404, detail=f"Pipeline not found: {pipeline_id}")
+
+    terminal_statuses = {PipelineStatus.COMPLETED, PipelineStatus.CANCELLED, PipelineStatus.FAILED}
+    if pipeline.status not in terminal_statuses:
+        raise HTTPException(
+            status_code=409,
+            detail="只有已完成、已取消或已失败的流水线才可清理 Worktree",
+        )
+
+    git_ctx = pipeline.context.git
+    if not git_ctx.enabled or not git_ctx.worktree_path:
+        return {"removed": False, "reason": "该流水线未启用 Git 集成"}
+
+    from src.services.git_service import GitError, get_git_service
+    from pathlib import Path
+
+    git = get_git_service()
+    repo_root = git_ctx.repo_root
+    wt_path = git_ctx.worktree_path
+    branch = git_ctx.working_branch
+    errors: list[str] = []
+
+    # 移除 worktree
     try:
-        diff_text = service.git_diff_for_pipeline(pipeline)
-    except GitError as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
-    return Response(content=diff_text, media_type="text/plain; charset=utf-8")
+        if repo_root:
+            git.remove_worktree(repo_root, wt_path)
+    except GitError as exc:
+        errors.append(f"remove_worktree: {exc}")
 
+    # 删除功能分支（仅在 pipeline CANCELLED / FAILED 时删除，COMPLETED 保留供 PR）
+    branch_deleted = False
+    if pipeline.status != PipelineStatus.COMPLETED and branch and repo_root:
+        try:
+            git.delete_branch(repo_root, branch, force=True)
+            branch_deleted = True
+        except GitError as exc:
+            errors.append(f"delete_branch: {exc}")
 
-@router.get("/{pipeline_id}/git/diff/{stage}")
-async def get_git_diff_for_stage(
-    pipeline_id: str,
-    stage: str,
-    service: PipelineService = Depends(get_pipeline_service),
-) -> Response:
-    pipeline = await _load_pipeline_or_404(pipeline_id, service)
-    try:
-        stage_type = StageType(stage)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown stage: {stage}") from error
+    # 更新 GitContext
+    git_ctx.worktree_path = None
+    await service.state_store.save(pipeline)
 
-    try:
-        diff_text = service.git_diff_for_pipeline(pipeline, stage_type=stage_type)
-    except GitError as error:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
-    return Response(content=diff_text, media_type="text/plain; charset=utf-8")
-
-
-@router.get("/{pipeline_id}/git/log")
-async def get_git_log(
-    pipeline_id: str,
-    service: PipelineService = Depends(get_pipeline_service),
-):
-    pipeline = await _load_pipeline_or_404(pipeline_id, service)
-    return [item.model_dump() for item in pipeline.context.git.stage_commits]
-
-
-@router.get("/{pipeline_id}/git/pr-command")
-async def get_pr_command(
-    pipeline_id: str,
-    service: PipelineService = Depends(get_pipeline_service),
-):
-    pipeline = await _load_pipeline_or_404(pipeline_id, service)
-    return {"pr_command": pipeline.context.git.pr_command}
-
-
-@router.delete("/{pipeline_id}/git")
-async def cleanup_pipeline_git(
-    pipeline_id: str,
-    service: PipelineService = Depends(get_pipeline_service),
-):
-    try:
-        pipeline = await service.cleanup_pipeline_git(pipeline_id)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
-    return pipeline.context.git.model_dump()
-
+    return {
+        "removed": True,
+        "worktree_path": wt_path,
+        "branch": branch,
+        "branch_deleted": branch_deleted,
+        "errors": errors,
+    }

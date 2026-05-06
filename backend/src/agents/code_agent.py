@@ -15,10 +15,16 @@ class CodeAgent(BaseAgent):
     """
     编码实现 Agent
     职责：基于技术方案中的 tech stack 与 file plan 生成多文件代码
+
+    执行流程：
+    1. 逐文件调用 LLM 生成代码，每次携带已生成文件的完整内容（跨文件感知）
+    2. 所有文件生成完毕后，做一次一致性检查，修复跨文件不一致问题
     """
 
     BATCH_SIZE = 1
     MAX_BATCH_RETRIES = 3
+    # 传给后续文件时，单个已生成文件内容的最大字符数（避免超长 prompt）
+    CONTEXT_FILE_MAX_CHARS = 1500
 
     async def execute(self, input_data: AgentInput) -> AgentOutput:
         solution_doc = input_data.context.get("solution_doc", "")
@@ -97,6 +103,7 @@ class CodeAgent(BaseAgent):
                     data_models=data_models,
                     full_file_plan=file_plan,
                     current_batch=pending_batch,
+                    generated_files=generated_files,   # ← 传入已生成文件的完整内容
                     generated_paths=generated_paths,
                     batch_index=batch_index,
                     total_batches=total_batches,
@@ -149,8 +156,78 @@ class CodeAgent(BaseAgent):
 
             generated_files.update(batch_files)
 
+        # ── 一致性检查回合 ──────────────────────────────────────────────
+        # 所有文件生成完毕后，让 LLM 做一次跨文件 review，修复 import 冲突、
+        # 函数签名不一致、数据结构定义出入等问题。
+        generated_files, review_usage, review_model = await self._consistency_review(
+            generated_files=generated_files,
+            usage_totals=usage_totals,
+            model_name=model_name,
+        )
+        if review_usage:
+            for key in usage_totals:
+                usage_totals[key] += int(review_usage.get(key, 0) or 0)
+        if review_model:
+            model_name = review_model
+
         final_usage = usage_totals if any(usage_totals.values()) else None
         return self._validate_required_files(generated_files, target_files), final_usage, model_name
+
+    async def _consistency_review(
+        self,
+        *,
+        generated_files: dict[str, str],
+        usage_totals: dict[str, int],
+        model_name: str,
+    ) -> tuple[dict[str, str], dict[str, int] | None, str]:
+        """对所有已生成文件做一次一致性检查，返回修正后的文件集合。
+
+        若 LLM 认为没有问题或无法解析响应，原样返回 generated_files。
+        此步骤失败不应阻断流水线——catch 所有异常，记录并跳过。
+        """
+        if not generated_files:
+            return generated_files, None, model_name
+
+        files_block = self._build_files_context(generated_files, max_chars_per_file=None)
+        user_message = f"""以下是本次代码生成任务产出的全部文件。请做跨文件一致性检查，找出并修复以下类型的问题：
+
+1. import 路径错误或引用了不存在的模块
+2. 函数/类名在不同文件间不一致（一个文件定义为 A，另一个文件调用时用 B）
+3. 数据结构字段名不一致（如 user_id vs userId）
+4. 配置常量在多个文件中重复定义且值不同
+5. 明显的语法错误（缩进、括号未闭合等）
+
+已生成的文件：
+{files_block}
+
+输出规则：
+- 如果存在需要修复的问题，使用 <file path="路径"> <content> 修正后的完整内容 </content> </file> 格式只输出**需要修改**的文件
+- 如果所有文件已经一致且正确，只输出一行：NO_CHANGES
+- 不要解释，不要输出 Markdown，不要输出未修改的文件
+"""
+        try:
+            response = await self.call_llm_response(user_message, temperature=0.05)
+            response_text = response.content.strip()
+
+            if response_text == "NO_CHANGES" or not response_text:
+                return generated_files, response.usage, response.model or model_name
+
+            fixes = self._parse_tagged_files(response_text)
+            if fixes:
+                # 只接受本次任务范围内的文件，忽略 LLM 幻觉出的新路径
+                valid_fixes = {
+                    path: content
+                    for path, content in fixes.items()
+                    if path in generated_files
+                }
+                if valid_fixes:
+                    merged = {**generated_files, **valid_fixes}
+                    return merged, response.usage, response.model or model_name
+
+            return generated_files, response.usage, response.model or model_name
+        except Exception:
+            # 一致性检查失败不阻断流水线
+            return generated_files, None, model_name
 
     def _build_batch_prompt(
         self,
@@ -163,12 +240,19 @@ class CodeAgent(BaseAgent):
         data_models: Any,
         full_file_plan: list[dict[str, Any]],
         current_batch: list[dict[str, Any]],
+        generated_files: dict[str, str],
         generated_paths: list[str],
         batch_index: int,
         total_batches: int,
         retry_index: int,
         feedback: str | None,
     ) -> str:
+        # 已生成文件的内容摘要（用于跨文件感知）
+        generated_context = self._build_files_context(
+            generated_files,
+            max_chars_per_file=self.CONTEXT_FILE_MAX_CHARS,
+        )
+
         user_message = f"""请基于以下需求文档、技术方案和既定文件清单，生成当前批次的完整可运行代码。
 
 ## 需求文档
@@ -195,8 +279,8 @@ class CodeAgent(BaseAgent):
 ## 当前需要生成的文件批次（第 {batch_index}/{total_batches} 批，第 {retry_index} 次尝试）
 {json.dumps(current_batch, ensure_ascii=False, indent=2)}
 
-## 已经生成完成的文件路径
-{json.dumps(generated_paths, ensure_ascii=False, indent=2)}
+## 已生成的文件内容（请保持 import 路径、函数签名、数据结构与这些文件一致）
+{generated_context if generated_context else "（暂无，这是第一个文件）"}
 
 请按以下标签格式返回当前批次的每个文件：
 <file path="相对文件路径">
@@ -211,8 +295,8 @@ class CodeAgent(BaseAgent):
 - 只返回当前批次要求生成的文件，不要省略
 - 路径必须与当前批次 file_plan 对齐，不能返回 output.txt 之类的兜底文件
 - 文件内容必须是完整实现，不能只写 TODO 或伪代码
+- import 的模块路径和函数名必须与已生成文件中的定义完全一致
 - 优先使用 `content` 标签返回纯文本；仅在你无法直接输出文本时才使用 `content_base64`
-- 控制文件体积，优先生成简洁实现：单文件建议不超过 140 行，避免长篇注释和重复样板
 - 如果这是重试，请只补齐当前批次里尚未返回的文件
 """
 
@@ -220,6 +304,27 @@ class CodeAgent(BaseAgent):
             user_message += f"\n\n请根据以下反馈修改：\n{feedback}"
 
         return user_message
+
+    def _build_files_context(
+        self,
+        files: dict[str, str],
+        *,
+        max_chars_per_file: int | None,
+    ) -> str:
+        """把已生成文件拼成可读的上下文字符串。
+
+        max_chars_per_file=None 表示不截断（用于一致性检查回合）。
+        """
+        if not files:
+            return ""
+        parts: list[str] = []
+        for path, content in files.items():
+            if max_chars_per_file is not None and len(content) > max_chars_per_file:
+                body = content[:max_chars_per_file] + f"\n... （已截断，共 {len(content)} 字符）"
+            else:
+                body = content
+            parts.append(f"=== {path} ===\n{body}")
+        return "\n\n".join(parts)
 
     def _normalize_stack(self, value: Any) -> dict[str, str]:
         defaults = {

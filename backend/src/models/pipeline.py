@@ -42,38 +42,56 @@ class ApproveAction(str, Enum):
 
 
 class GitMode(str, Enum):
+    """Git 集成模式。
+
+    DISABLED: 没有提供 project_path 或 git CLI 不可用，走"无 Git 模式"。
+    WORKTREE: V1 默认模式——基于 git worktree 在隔离工作树中跑流水线。
+    """
+
     DISABLED = "disabled"
     WORKTREE = "worktree"
 
 
 class StageCommit(BaseModel):
-    """每个 stage 完成时的 commit 锚点。"""
+    """每个 stage 完成时形成的 commit 锚点。
+
+    用途：
+    - 作为 reject / retry 时 reset_hard 的目标
+    - 作为前端 Git 时间线展示数据
+    """
 
     stage_type: StageType
     commit_sha: str
     commit_message: str
     committed_at: datetime
-    files_changed: list[str] = Field(default_factory=list)
+    files_changed: List[str] = []
 
 
 class GitContext(BaseModel):
+    """流水线的 Git 状态快照。"""
+
     mode: GitMode = GitMode.DISABLED
     enabled: bool = False
 
+    # —— 仓库信息 ——
     repo_root: Optional[str] = None
     base_branch: Optional[str] = None
     base_commit: Optional[str] = None
 
+    # —— Worktree 信息 ——
     worktree_path: Optional[str] = None
     working_branch: Optional[str] = None
-    initialized: bool = False
+    initialized: bool = False  # 仓库是否由 FlowState 自动 init
 
-    stage_commits: list[StageCommit] = Field(default_factory=list)
+    # —— Stage commit 锚点 ——
+    stage_commits: List[StageCommit] = []
 
-    total_files_changed: list[str] = Field(default_factory=list)
+    # —— 累计统计 ——
+    total_files_changed: List[str] = []
     head_commit: Optional[str] = None
-    diff_stats: Optional[dict] = None
+    diff_stats: Optional[Dict[str, Any]] = None
 
+    # —— 交付元数据 ——
     pr_title: Optional[str] = None
     pr_description: Optional[str] = None
     pr_command: Optional[str] = None

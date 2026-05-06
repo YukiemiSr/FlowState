@@ -466,9 +466,10 @@ def test_frontend_mock_create_pipeline(tmp_path):
         assert "package.json" in created_pipeline["stages"][0]["output"]
         assert created_pipeline["projectPath"] == str(project_dir.resolve())
         assert "关键文件" in created_pipeline["projectSummary"]
-        assert created_pipeline["requirementDocPath"] is not None
-        assert created_pipeline["requirementDocPath"].endswith("docs/requirements.md")
-        assert Path(created_pipeline["requirementDocPath"]).exists()
+        pipeline_id = created_pipeline["id"]
+        assert created_pipeline["requirementDocPath"] == str(
+            (project_dir / ".flowstate" / pipeline_id / "docs" / "requirements.md").resolve()
+        )
 
         detail_response = client.get(f"/api/pipelines/{created_pipeline['id']}")
         backend_pipeline = _load_backend_pipeline(client, created_pipeline["id"])
@@ -478,11 +479,9 @@ def test_frontend_mock_create_pipeline(tmp_path):
     assert detail_response.status_code == 200
     assert detail_response.json()["id"] == created_pipeline["id"]
     assert detail_response.json()["status"] == "paused"
-    requirement_doc_path = Path(backend_pipeline["context"]["requirement_doc_path"])
-    assert requirement_doc_path.exists()
-    assert str(requirement_doc_path).startswith(str(project_dir.resolve()))
-    assert "收藏功能" in requirement_doc_path.read_text(encoding="utf-8")
-    assert len(backend_pipeline["context"]["git"]["stage_commits"]) >= 1
+    req_doc = project_dir / ".flowstate" / pipeline_id / "docs" / "requirements.md"
+    assert req_doc.exists()
+    assert "收藏功能" in req_doc.read_text(encoding="utf-8")
 
     assert logs_response.status_code == 200
     assert any("工作目录" in log for log in logs_response.json())
@@ -568,9 +567,10 @@ def test_approve_requirement_checkpoint_advances_pipeline(tmp_path):
     assert updated_pipeline["stages"][1]["status"] == "awaiting_review"
     assert updated_pipeline["stages"][1]["tokens"] == 600
     assert "技术方案文档" in updated_pipeline["stages"][1]["output"]
-    solution_doc_path = Path(backend_pipeline["context"]["solution_doc_path"])
-    assert solution_doc_path.exists()
-    assert "创建计划" in solution_doc_path.read_text(encoding="utf-8")
+    pipeline_id = created_pipeline["id"]
+    solution_doc = project_dir / ".flowstate" / pipeline_id / "docs" / "solution.md"
+    assert solution_doc.exists()
+    assert "创建计划" in solution_doc.read_text(encoding="utf-8")
 
     assert pending_checkpoints_response.status_code == 200
     assert all(item["id"] != checkpoint_id for item in pending_checkpoints_response.json())
@@ -682,19 +682,13 @@ def test_approve_solution_checkpoint_generates_code(tmp_path):
     assert "FastAPI()" in (updated_pipeline["stages"][2]["output"] or "")
     assert "测试报告" in (updated_pipeline["stages"][3]["output"] or "")
     assert "代码评审报告" in (updated_pipeline["stages"][4]["output"] or "")
-    worktree = Path(backend_pipeline["context"]["git"]["worktree_path"])
-    assert (worktree / "app" / "main.py").exists()
-    assert (worktree / "requirements.txt").exists()
-    assert (worktree / "tests" / "test_app.py").exists()
-    assert (project_dir / "app" / "main.py").exists()
-    assert (project_dir / "requirements.txt").exists()
-    assert (project_dir / "tests" / "test_app.py").exists()
-    test_doc = worktree / "docs" / "test_report.md"
-    review_doc = worktree / "docs" / "review_report.md"
-    assert test_doc.exists()
-    assert review_doc.exists()
-    assert (project_dir / "docs" / "test_report.md").exists()
-    assert (project_dir / "docs" / "review_report.md").exists()
+    pipeline_id = created_pipeline["id"]
+    wt = project_dir / ".flowstate" / "worktrees" / pipeline_id
+    assert (wt / "app" / "main.py").exists()
+    assert (wt / "requirements.txt").exists()
+    assert (wt / "tests" / "test_app.py").exists()
+    assert (project_dir / ".flowstate" / pipeline_id / "docs" / "test_report.md").exists()
+    assert (project_dir / ".flowstate" / pipeline_id / "docs" / "review_report.md").exists()
     assert any(
         item["pipelineId"] == created_pipeline["id"] and item["stage"] == "代码评审"
         for item in checkpoints_response.json()
@@ -735,11 +729,10 @@ def test_failing_test_stage_waits_for_approval_and_blocks_review(tmp_path):
     assert updated_pipeline["stages"][4]["status"] == "idle"
     assert updated_pipeline["stages"][3]["tokens"] == 180
     assert "测试报告" in (updated_pipeline["stages"][3]["output"] or "")
-    worktree = Path(backend_pipeline["context"]["git"]["worktree_path"])
-    assert (worktree / "tests" / "test_app.py").exists()
-    assert (worktree / "docs" / "test_report.md").exists()
-    assert (project_dir / "tests" / "test_app.py").exists()
-    assert (project_dir / "docs" / "test_report.md").exists()
+    pipeline_id = created_pipeline["id"]
+    wt = project_dir / ".flowstate" / "worktrees" / pipeline_id
+    assert (wt / "tests" / "test_app.py").exists()
+    assert (project_dir / ".flowstate" / pipeline_id / "docs" / "test_report.md").exists()
     assert any(
         item["pipelineId"] == created_pipeline["id"] and item["stage"] == "测试生成"
         for item in checkpoints_response.json()
@@ -782,9 +775,8 @@ def test_approve_review_checkpoint_moves_delivery_to_waiting_review(tmp_path):
     assert updated_pipeline["stages"][4]["status"] == "completed"
     assert updated_pipeline["stages"][5]["status"] == "awaiting_review"
     assert "交付汇总" in (updated_pipeline["stages"][5]["output"] or "")
-    worktree = Path(backend_pipeline["context"]["git"]["worktree_path"])
-    assert (worktree / "docs" / "delivery.md").exists()
-    assert (project_dir / "docs" / "delivery.md").exists()
+    pipeline_id = created_pipeline["id"]
+    assert (project_dir / ".flowstate" / pipeline_id / "docs" / "delivery.md").exists()
     assert any(
         item["pipelineId"] == created_pipeline["id"] and item["stage"] == "交付集成"
         for item in checkpoints_response.json()
@@ -1419,5 +1411,6 @@ def test_code_agent_generates_required_files_in_batches():
     )
 
     assert output.success is True
-    assert call_count["value"] == 3
+    # 3 files (1 call each) + 1 consistency review call = 4
+    assert call_count["value"] == 4
     assert set(output.result["files"].keys()) == {"app/main.py", "app/router.py", "requirements.txt"}

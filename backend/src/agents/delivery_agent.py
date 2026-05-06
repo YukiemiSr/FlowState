@@ -55,10 +55,10 @@ class DeliveryAgent(BaseAgent):
 {review_report[:500]}
 
 请输出 JSON 格式（只输出 JSON）：
-1. pr_title: PR 标题
-2. pr_description: PR 描述（Markdown 格式，包含变更说明和验证步骤）
-3. branch: 功能分支名
-4. commit_message: Git 提交信息
+1. pr_title: PR 标题（简洁，不超过 72 字符）
+2. pr_description: PR 描述（Markdown 格式，包含变更说明、测试步骤、验收标准）
+3. branch: 功能分支名（如已知请沿用，否则生成 feature/xxx）
+4. commit_message: Git 提交信息（遵循 Conventional Commits 规范）
 5. deployment_command: 部署命令
 """
 

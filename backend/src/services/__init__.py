@@ -1,10 +1,1 @@
-"""Service helpers."""
-
-from .git_service import (
-    GitError,
-    NestedRepoError,
-    NotARepoError,
-    WorktreeBusyError,
-    GitService,
-)
-
+"""通用业务服务层。"""
