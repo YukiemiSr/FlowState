@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -15,13 +16,17 @@ from src.agents.solution_agent import SolutionAgent
 from src.agents.test_agent import TestAgent
 from src.models.pipeline import (
     ApproveAction,
+    GitContext,
+    GitMode,
     Pipeline,
     PipelineContext,
     PipelineStatus,
+    StageCommit,
     StageNode,
     StageStatus,
     StageType,
 )
+from src.services.git_service import GitError, GitService, get_git_service
 from src.store.state_store import StateStore
 
 
@@ -93,6 +98,190 @@ def _resolve_project_path(project_path: str) -> Path | None:
     return resolved_path
 
 
+# ---------------------------------------------------------------------------
+# Git 辅助：分支名生成
+# ---------------------------------------------------------------------------
+
+def _make_branch_name(pipeline_id: str, title: str) -> str:
+    """生成形如 devflow/pipe_20260506_120000-my-feature 的分支名。"""
+    slug = re.sub(r"[^\w一-鿿]+", "-", title.lower()).strip("-")
+    # 只保留 ASCII 部分（中文 slug 对 git 合法但可读性差）
+    slug_ascii = re.sub(r"[^\w-]+", "", slug)[:30].strip("-") or "task"
+    return f"devflow/{pipeline_id}-{slug_ascii}"
+
+
+# ---------------------------------------------------------------------------
+# Git 辅助：pipeline 级 git 准备
+# ---------------------------------------------------------------------------
+
+def _prepare_git_for_pipeline(
+    pipeline: Pipeline,
+    git: GitService,
+) -> None:
+    """检测 / 初始化 git 仓库，创建 worktree，更新 pipeline.context.git。
+
+    失败时不抛异常——降级为 DISABLED 模式，流水线继续正常运行。
+    """
+    project_path = pipeline.context.project_path
+    if not project_path:
+        return
+
+    base_dir = Path(project_path)
+    git_ctx = pipeline.context.git
+
+    # ── git 可用性检查 ────────────────────────────────────────────────
+    if not git.is_available():
+        pipeline.logs.append(f"[{_timestamp()}] [Git] git CLI 不可用，跳过 Git 集成")
+        return
+
+    initialized = False
+    repo_root: Path
+
+    # ── 仓库状态探测 ──────────────────────────────────────────────────
+    if git.is_git_repo(base_dir):
+        repo_root = base_dir
+    else:
+        # 检查父目录是否是 git 仓库（嵌套仓库场景）
+        enclosing = git.find_enclosing_repo(base_dir)
+        if enclosing is not None:
+            pipeline.logs.append(
+                f"[{_timestamp()}] [Git] {base_dir} 位于上级仓库 {enclosing} 内部，"
+                "不自动 init，跳过 Git 集成"
+            )
+            return
+        # 自动 init
+        try:
+            git.init_repo(base_dir, default_branch="main")
+            git.write_default_gitignore(base_dir)
+            # 确保 .flowstate/ 在 .gitignore 里（worktree 路径）
+            git.ensure_gitignore_entry(base_dir, ".flowstate/")
+            git.baseline_commit(base_dir, message="chore: flowstate baseline")
+            repo_root = base_dir
+            initialized = True
+            pipeline.logs.append(
+                f"[{_timestamp()}] [Git] 已自动初始化 Git 仓库并创建 baseline commit"
+            )
+        except GitError as exc:
+            pipeline.logs.append(
+                f"[{_timestamp()}] [Git] 自动 init 失败: {exc}，跳过 Git 集成"
+            )
+            return
+
+    # ── 创建 worktree ─────────────────────────────────────────────────
+    base_commit = git.head_commit(repo_root) if git.has_any_commit(repo_root) else None
+    if not base_commit:
+        pipeline.logs.append(f"[{_timestamp()}] [Git] 仓库无任何 commit，跳过 Git 集成")
+        return
+
+    base_branch = git.current_branch(repo_root)
+    branch_name = _make_branch_name(pipeline.id, pipeline.title)
+    worktree_path = repo_root / ".flowstate" / "worktrees" / pipeline.id
+
+    try:
+        git.add_worktree(repo_root, worktree_path, branch=branch_name, base=base_commit)
+        # worktree 内也确保 .gitignore 有 .flowstate/
+        git.ensure_gitignore_entry(worktree_path, ".flowstate/")
+    except GitError as exc:
+        pipeline.logs.append(
+            f"[{_timestamp()}] [Git] 创建 worktree 失败: {exc}，跳过 Git 集成"
+        )
+        return
+
+    # ── 更新 GitContext ───────────────────────────────────────────────
+    git_ctx.mode = GitMode.WORKTREE
+    git_ctx.enabled = True
+    git_ctx.repo_root = str(repo_root)
+    git_ctx.base_branch = base_branch
+    git_ctx.base_commit = base_commit
+    git_ctx.worktree_path = str(worktree_path)
+    git_ctx.working_branch = branch_name
+    git_ctx.initialized = initialized
+
+    pipeline.logs.append(
+        f"[{_timestamp()}] [Git] Worktree 已就绪: {worktree_path}"
+    )
+    pipeline.logs.append(
+        f"[{_timestamp()}] [Git] 工作分支: {branch_name}（基于 {base_branch}@{base_commit[:8]}）"
+    )
+
+
+def _effective_project_path(pipeline: Pipeline) -> str:
+    """返回当前流水线写文件应用的目录。
+
+    Git 启用时返回 worktree_path，否则返回原 project_path。
+    """
+    git_ctx = pipeline.context.git
+    if git_ctx.enabled and git_ctx.worktree_path:
+        return git_ctx.worktree_path
+    return pipeline.context.project_path
+
+
+def _effective_docs_path(pipeline: Pipeline) -> str:
+    """返回流水线文档（requirements.md 等）应写入的目录。
+
+    文档写到 <repo_root>/.flowstate/<pipeline_id>/docs/（或无 Git 时写到 project_path 下）。
+    该目录由 .gitignore 忽略，不会被 commit 进 worktree。
+    """
+    git_ctx = pipeline.context.git
+    if git_ctx.enabled and git_ctx.repo_root:
+        base = git_ctx.repo_root
+    elif pipeline.context.project_path:
+        base = pipeline.context.project_path
+    else:
+        return ""
+    docs_dir = Path(base) / ".flowstate" / pipeline.id / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    return str(docs_dir)
+
+
+def _commit_stage(
+    pipeline: Pipeline,
+    stage_type: StageType,
+    commit_message: str,
+    git: GitService,
+) -> None:
+    """在 worktree 中提交当前阶段产物，更新 GitContext。
+
+    若 Git 未启用或提交失败，静默跳过（不影响流水线）。
+    """
+    git_ctx = pipeline.context.git
+    if not git_ctx.enabled or not git_ctx.worktree_path:
+        return
+
+    wt = git_ctx.worktree_path
+    try:
+        sha = git.stage_and_commit(wt, commit_message)
+        if sha is None:
+            # 无变更——可能 stage 没写任何文件，记录一下
+            pipeline.logs.append(
+                f"[{_timestamp()}] [Git] {stage_type.value}: 无文件变更，跳过 commit"
+            )
+            return
+
+        now = datetime.now()
+        changed = git.changed_files(wt, base=git_ctx.base_commit or "HEAD~1", head=sha)
+        stage_commit = StageCommit(
+            stage_type=stage_type,
+            commit_sha=sha,
+            commit_message=commit_message,
+            committed_at=now,
+            files_changed=changed,
+        )
+        git_ctx.stage_commits.append(stage_commit)
+        git_ctx.head_commit = sha
+        for f in changed:
+            if f not in git_ctx.total_files_changed:
+                git_ctx.total_files_changed.append(f)
+
+        pipeline.logs.append(
+            f"[{_timestamp()}] [Git] commit {sha[:8]}: {commit_message}"
+        )
+    except GitError as exc:
+        pipeline.logs.append(
+            f"[{_timestamp()}] [Git] commit 失败（{stage_type.value}）: {exc}"
+        )
+
+
 def _summarize_project_path(project_path: Path) -> str:
     top_level_dirs: list[str] = []
     top_level_files: list[str] = []
@@ -139,13 +328,18 @@ def _summarize_project_path(project_path: Path) -> str:
     )
 
 
-def _write_project_doc(project_path: str, filename: str, content: str) -> Path:
-    if not project_path:
-        raise PipelineValidationError("缺少项目目录，无法写入阶段文档")
+def _write_project_doc(docs_path: str, filename: str, content: str) -> Path:
+    """将阶段文档写到 docs_path 目录下。
 
-    main_dir = Path(project_path) / "main"
-    main_dir.mkdir(parents=True, exist_ok=True)
-    doc_path = main_dir / filename
+    docs_path 由 _effective_docs_path(pipeline) 提供，
+    通常是 <worktree>/.flowstate/<pipeline_id>/docs/。
+    """
+    if not docs_path:
+        raise PipelineValidationError("缺少文档目录，无法写入阶段文档")
+
+    docs_dir = Path(docs_path)
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    doc_path = docs_dir / filename
     doc_path.write_text(content, encoding="utf-8")
     return doc_path
 
@@ -176,9 +370,15 @@ def _write_generated_code(project_path: str, files: dict[str, str]) -> list[str]
 class PipelineService:
     """A tiny adapter around either an injected engine or local persistence."""
 
-    def __init__(self, engine=None, state_store: StateStore | None = None):
+    def __init__(
+        self,
+        engine=None,
+        state_store: StateStore | None = None,
+        git_service: GitService | None = None,
+    ):
         self.engine = engine
         self.state_store = state_store or getattr(engine, "state_store", None) or StateStore()
+        self.git = git_service or get_git_service()
 
     async def create_pipeline(
         self,
@@ -222,6 +422,10 @@ class PipelineService:
                 *([f"[{_timestamp()}] 已接收需求: {requirement[:80]}"] if requirement else []),
                 *([f"[{_timestamp()}] 项目目录扫描完成"] if project_summary else []),
             ]
+
+        # ── Git 准备（非阻塞：失败则降级为 DISABLED 模式）────────────────
+        if normalized_project_path:
+            _prepare_git_for_pipeline(pipeline, self.git)
 
         if start_immediately and pipeline.stages:
             now = datetime.now()
@@ -444,6 +648,34 @@ class PipelineService:
         if reason:
             pipeline.logs.append(f"[{_timestamp()}] 拒绝原因: {reason}")
 
+        # ── Git：回退 worktree 到上一个 stage 的 commit 锚点 ──────────
+        git_ctx = pipeline.context.git
+        if git_ctx.enabled and git_ctx.worktree_path and git_ctx.stage_commits:
+            # 找到当前被拒绝 stage 之前最近的一个 commit 锚点
+            reset_target: str | None = None
+            for sc in reversed(git_ctx.stage_commits):
+                if sc.stage_type != stage.stage_type:
+                    reset_target = sc.commit_sha
+                    break
+            if reset_target is None:
+                reset_target = git_ctx.base_commit  # 回到起点
+            if reset_target:
+                try:
+                    self.git.reset_hard(git_ctx.worktree_path, reset_target)
+                    git_ctx.head_commit = reset_target
+                    # 移除被 reject 的 stage commit 记录
+                    git_ctx.stage_commits = [
+                        sc for sc in git_ctx.stage_commits
+                        if sc.stage_type != stage.stage_type
+                    ]
+                    pipeline.logs.append(
+                        f"[{_timestamp()}] [Git] Worktree 已回退到 {reset_target[:8]}"
+                    )
+                except GitError as exc:
+                    pipeline.logs.append(
+                        f"[{_timestamp()}] [Git] Worktree 回退失败: {exc}"
+                    )
+
         await self.state_store.save(pipeline)
         return pipeline
 
@@ -477,7 +709,7 @@ class PipelineService:
             pipeline.context.requirement_doc = requirement_doc
             if requirement_doc:
                 requirement_doc_path = _write_project_doc(
-                    pipeline.context.project_path,
+                    _effective_docs_path(pipeline),
                     "requirements.md",
                     requirement_doc,
                 )
@@ -565,7 +797,7 @@ class PipelineService:
                 pipeline.context.solution_structured = structured_solution
             if solution_doc:
                 solution_doc_path = _write_project_doc(
-                    pipeline.context.project_path,
+                    _effective_docs_path(pipeline),
                     "solution.md",
                     solution_doc,
                 )
@@ -634,7 +866,7 @@ class PipelineService:
             if isinstance(generated_files, dict):
                 pipeline.context.generated_code = generated_files
                 written_files = _write_generated_code(
-                    pipeline.context.project_path,
+                    _effective_project_path(pipeline),
                     generated_files,
                 )
             else:
@@ -647,6 +879,11 @@ class PipelineService:
             if written_files:
                 preview = "、".join(Path(path).name for path in written_files[:5])
                 pipeline.logs.append(f"[{_timestamp()}] 生成代码已写入: {preview}")
+            _commit_stage(
+                pipeline, StageType.CODING,
+                "feat: generate code via FlowState (stage3)",
+                self.git,
+            )
             await self.state_store.save(pipeline)
             await self._run_testing(pipeline)
         except Exception as error:
@@ -682,9 +919,12 @@ class PipelineService:
             else:
                 agent = TestAgent()
 
+            # 将 worktree/project 路径写入 context，让 TestAgent 知道去哪儿跑 pytest
+            ctx_dump = pipeline.context.model_dump()
+            ctx_dump["project_path"] = _effective_project_path(pipeline)
             input_data = AgentInput(
                 task_description="执行阶段: testing",
-                context=pipeline.context.model_dump(),
+                context=ctx_dump,
                 human_feedback=testing_stage.human_feedback,
             )
             output = await agent.execute(input_data)
@@ -702,16 +942,18 @@ class PipelineService:
             if isinstance(test_report, str) and test_report.strip():
                 pipeline.context.test_report = test_report
                 report_path = _write_project_doc(
-                    pipeline.context.project_path,
+                    _effective_docs_path(pipeline),
                     "test_report.md",
                     test_report,
                 )
                 pipeline.logs.append(f"[{_timestamp()}] 测试报告已写入: {report_path}")
 
-            test_files = output.result.get("test_files")
-            if isinstance(test_files, dict):
+            # 将测试文件写入 effective project path（worktree 或 project_path）。
+            # 真实 TestAgent 在 _run_pytest 里也会自己写，这里保证 FakeAgent 场景下也落盘。
+            test_files = output.result.get("test_files") or {}
+            if isinstance(test_files, dict) and test_files:
                 written_tests = _write_generated_code(
-                    pipeline.context.project_path,
+                    _effective_project_path(pipeline),
                     test_files,
                 )
             else:
@@ -727,9 +969,14 @@ class PipelineService:
             _append_usage_log(pipeline, testing_stage)
             if written_tests:
                 preview = "、".join(Path(path).name for path in written_tests[:5])
-                pipeline.logs.append(f"[{_timestamp()}] 生成测试文件已写入: {preview}")
+                pipeline.logs.append(f"[{_timestamp()}] 测试文件已写入: {preview}")
             if output.needs_human_review:
                 pipeline.logs.append(f"[{_timestamp()}] 测试阶段进入人工确认，等待审批")
+            _commit_stage(
+                pipeline, StageType.TESTING,
+                "test: add generated tests (stage4)",
+                self.git,
+            )
             await self.state_store.save(pipeline)
             if testing_stage.status == StageStatus.COMPLETED:
                 await self._run_review(pipeline)
@@ -766,9 +1013,40 @@ class PipelineService:
             else:
                 agent = ReviewAgent()
 
+            # 收集 diff 供 ReviewAgent 做基于变更的评审
+            git_ctx = pipeline.context.git
+            diff_text: str | None = None
+            if git_ctx.enabled and git_ctx.worktree_path and git_ctx.base_commit:
+                try:
+                    diff_text = self.git.diff(
+                        git_ctx.worktree_path,
+                        base=git_ctx.base_commit,
+                        head="HEAD",
+                    )
+                    diff_stats = self.git.diff_stats(
+                        git_ctx.worktree_path,
+                        base=git_ctx.base_commit,
+                        head="HEAD",
+                    )
+                    git_ctx.diff_stats = diff_stats
+                    pipeline.logs.append(
+                        f"[{_timestamp()}] [Git] 本次变更: "
+                        f"{diff_stats.get('files', 0)} 文件, "
+                        f"+{diff_stats.get('insertions', 0)} / "
+                        f"-{diff_stats.get('deletions', 0)}"
+                    )
+                except GitError:
+                    pass
+
+            # 将 diff 注入 context 供 ReviewAgent 使用
+            ctx_dump = pipeline.context.model_dump()
+            if diff_text:
+                ctx_dump["code_diff"] = diff_text[:8000]  # 限制长度防止超 token
+                pipeline.context.code_diff = diff_text[:8000]
+
             input_data = AgentInput(
                 task_description="执行阶段: code_review",
-                context=pipeline.context.model_dump(),
+                context=ctx_dump,
                 human_feedback=review_stage.human_feedback,
             )
             output = await agent.execute(input_data)
@@ -786,7 +1064,7 @@ class PipelineService:
             if isinstance(review_report, str) and review_report.strip():
                 pipeline.context.review_report = review_report
                 review_path = _write_project_doc(
-                    pipeline.context.project_path,
+                    _effective_docs_path(pipeline),
                     "review_report.md",
                     review_report,
                 )
@@ -858,11 +1136,28 @@ class PipelineService:
             if isinstance(delivery_result, str) and delivery_result.strip():
                 pipeline.context.delivery_result = delivery_result
                 delivery_path = _write_project_doc(
-                    pipeline.context.project_path,
+                    _effective_docs_path(pipeline),
                     "delivery.md",
                     delivery_result,
                 )
                 pipeline.logs.append(f"[{_timestamp()}] 交付文档已写入: {delivery_path}")
+
+            # 将 DeliveryAgent 产出的 PR 元数据同步到 GitContext
+            git_ctx = pipeline.context.git
+            if git_ctx.enabled:
+                git_ctx.pr_title = output.result.get("pr_title") or git_ctx.pr_title
+                git_ctx.pr_description = output.result.get("pr_description") or git_ctx.pr_description
+                pr_cmd = output.result.get("pr_command")
+                if pr_cmd:
+                    git_ctx.pr_command = pr_cmd
+                elif git_ctx.working_branch:
+                    # 兜底：拼出一条可直接用的 gh pr create 命令
+                    title = (git_ctx.pr_title or "feat: FlowState auto-generated").replace('"', '\\"')
+                    git_ctx.pr_command = (
+                        f'gh pr create --title "{title}" '
+                        f'--head {git_ctx.working_branch} '
+                        f'--body-file .flowstate/{pipeline.id}/docs/delivery.md'
+                    )
 
             pipeline.updated_at = now
             pipeline.status = (
